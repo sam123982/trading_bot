@@ -1,52 +1,94 @@
 import pandas as pd
-from indicators import calculate_ema, calculate_vwap, calculate_atr
 
-def check_trade_signal(data: pd.DataFrame) -> str:
-    """
-    Determines if we should enter a CALL (BUY) or PUT (SELL) trade.
-    
-    Conditions:
-    - Buy CALL: Price above VWAP & EMA(9) > EMA(21)
-    - Buy PUT: Price below VWAP & EMA(9) < EMA(21)
-    
-    :param data: DataFrame containing market data (with 'close', 'high', 'low', 'volume')
-    :return: 'CALL' for bullish trade, 'PUT' for bearish trade, or 'NO_TRADE'
-    """
-    data["EMA_9"] = calculate_ema(data, 9)
-    data["EMA_21"] = calculate_ema(data, 21)
-    data["VWAP"] = calculate_vwap(data)
+class Strategy:
+    def __init__(self, atr_multiplier=0.5, daily_loss_limit=400):
+        self.atr_multiplier = atr_multiplier
+        self.daily_loss_limit = daily_loss_limit
+        self.daily_loss = 0  # Track total daily losses
+        self.active_trade = None  # Store current active trade
 
-    latest = data.iloc[-1]  # Get the latest candle
+    def check_trade_conditions(self, df: pd.DataFrame) -> bool:
+        """
+        Check entry conditions for a trade.
+        - Bullish signal for option: At least 2 of (VWAP, EMA Crossover, High RVOL, ADX > 20) + IV Rank > 50
+        """
+        latest = df.iloc[-1]
 
-    if latest["close"] > latest["VWAP"] and latest["EMA_9"] > latest["EMA_21"]:
-        return "CALL"
-    elif latest["close"] < latest["VWAP"] and latest["EMA_9"] < latest["EMA_21"]:
-        return "PUT"
-    else:
-        return "NO_TRADE"
+        price_above_vwap = latest["close"] > latest["VWAP"]
+        ema_crossover = latest["EMA_9"] > latest["EMA_21"]
+        high_rvol = latest.get("RVOL", 1) >= 2  # Ensure RVOL is available
+        strong_trend = latest.get("ADX", 0) > 20  # Ensure ADX is available
+        iv_rank_ok = latest.get("IV_Rank", 0) > 50  # IV Rank is mandatory
 
-def calculate_sl_tp(data: pd.DataFrame) -> tuple:
-    """
-    Calculate Stop-Loss (SL) and Take-Profit (TP) using ATR.
-    
-    - SL: Entry Price - (0.5 × ATR) for CALL, Entry Price + (0.5 × ATR) for PUT
-    - TP: Entry Price + (0.5 × ATR) for CALL, Entry Price - (0.5 × ATR) for PUT
+        # Count how many of the 4 conditions are met
+        conditions_met = sum([price_above_vwap, ema_crossover, high_rvol, strong_trend])
 
-    :param data: DataFrame containing 'close', 'high', 'low'
-    :return: Tuple (stop_loss, take_profit)
-    """
-    data["ATR"] = calculate_atr(data, period=14)
-    latest = data.iloc[-1]
+        # Require at least 2 out of 4 conditions + IV Rank mandatory
+        return conditions_met >= 2 and iv_rank_ok
 
-    atr_half = 0.5 * latest["ATR"]
+    def execute_trade(self, entry_price: float, atr: float):
+        """
+        Execute a new trade if conditions are met.
+        - Initializes trade details (entry price, stop-loss, take-profit).
+        - Ensures daily loss limit is not exceeded.
+        """
+        if self.daily_loss >= self.daily_loss_limit:
+            print("Daily loss limit reached. No more trades today.")
+            return None
 
-    if check_trade_signal(data) == "CALL":
-        stop_loss = latest["close"] - atr_half
-        take_profit = latest["close"] + atr_half
-    elif check_trade_signal(data) == "PUT":
-        stop_loss = latest["close"] + atr_half
-        take_profit = latest["close"] - atr_half
-    else:
-        stop_loss, take_profit = None, None
+        initial_sl = entry_price - (self.atr_multiplier * atr)
+        initial_tp = entry_price + (self.atr_multiplier * atr)
 
-    return stop_loss, take_profit
+        self.active_trade = {
+            "entry_price": entry_price,
+            "stop_loss": initial_sl,
+            "take_profit": initial_tp,
+        }
+        return self.active_trade
+
+    def trail_sl_tp(self, trade_details: dict, latest_price: float, atr: float) -> dict:
+        """
+        Adjusts the stop-loss (SL) and take-profit (TP) dynamically as price moves in favor.
+        - CALL: SL & TP move UP when option price increases.
+        - PUT: SL & TP move UP when option price increases (since we're bullish on the option's price).
+        """
+        entry_price = trade_details["entry_price"]
+        stop_loss = trade_details["stop_loss"]
+        take_profit = trade_details["take_profit"]
+
+        # ATR-based adjustment value
+        atr_adjustment = self.atr_multiplier * atr
+
+        if latest_price > entry_price + atr_adjustment:
+            stop_loss = max(stop_loss, latest_price - atr_adjustment)
+            take_profit = latest_price + atr_adjustment
+
+        return {"entry_price": entry_price, "stop_loss": stop_loss, "take_profit": take_profit}
+
+    def manage_trade(self, latest_price: float, atr: float) -> str:
+        """
+        Manage active trade:
+        - Adjust SL/TP dynamically
+        - Exit trade if SL or TP is hit
+        - Track daily loss
+        """
+        if not self.active_trade:
+            return "No Active Trade"
+
+        # Update SL/TP dynamically
+        self.active_trade = self.trail_sl_tp(self.active_trade, latest_price, atr)
+
+        if latest_price >= self.active_trade["take_profit"]:
+            print("Take Profit Hit ✅")
+            self.active_trade = None
+            return "Take Profit Hit"
+
+        elif latest_price <= self.active_trade["stop_loss"]:
+            loss = self.active_trade["entry_price"] - latest_price
+            self.daily_loss += abs(loss)  # Track cumulative loss
+            print(f"Stop Loss Hit ❌ - Loss: {loss}, Total Daily Loss: {self.daily_loss}")
+
+            self.active_trade = None  # Reset active trade
+            return "Stop Loss Hit"
+
+        return "Trade Active"
